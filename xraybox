@@ -37,6 +37,8 @@ ${C_BOLD}xraybox $VERSION${C_RESET} — менеджер Xray (VLESS / XHTTP / R
   $APP api status|outbounds|switch N
   $APP tun on|off|toggle|status
   $APP settings [show|set KEY VALUE]
+  $APP ping [all|N|ID|ИМЯ] [--http]  проверить задержку
+  $APP fastest              пинг всех и выбрать самый быстрый
   $APP sub add URL [--name NAME]
   $APP sub update [all|ID|ИМЯ]
   $APP sub list | sub rm ID|ИМЯ
@@ -45,9 +47,9 @@ ${C_BOLD}xraybox $VERSION${C_RESET} — менеджер Xray (VLESS / XHTTP / R
   $APP version              версия
 
 Переменные:
-  XRAYBOX_XRAY   путь к Xray (по умолчанию $DEFAULT_XRAY)
   XRAYBOX_HOME   каталог данных (по умолчанию $ROOT_DIR/data)
 
+Xray берётся только из $XRAY_BIN (папка bin/ проекта).
 TUN требует root/sudo. Mixed-прокси по умолчанию 127.0.0.1:12080,
 API — 127.0.0.1:10085. Секреты хранятся в state.json (chmod 600).
 EOF
@@ -75,7 +77,7 @@ cmd_add() {
     done
 
     resolve_xray
-    require_cmd jq curl base64 sha1sum
+    require_cmd jq curl base64 sha1sum timeout
     if [[ -n "$file" ]]; then
         add_from_file "$file" manual
         return $?
@@ -99,7 +101,8 @@ cmd_sub() {
             while (($# > 0)); do
                 case "$1" in
                     --name)
-                        name="${2:-}"; shift 2 ;;
+                        [[ $# -ge 2 ]] || die "После --name нужно имя"
+                        name="$2"; shift 2 ;;
                     *)
                         [[ -z "$url" ]] && url="$1" || die "Лишний аргумент: $1"
                         shift ;;
@@ -164,6 +167,50 @@ cmd_api() {
     esac
 }
 
+cmd_ping() {
+    local http=false selector="" all=false
+    while (($# > 0)); do
+        case "$1" in
+            --http|-x) http=true; shift ;;
+            all|-a) all=true; shift ;;
+            --help|-h)
+                msg "Использование: $APP ping [all|N|ID|ИМЯ] [--http]"
+                return 0
+                ;;
+            -*)
+                err "Неизвестный параметр: $1"
+                return 1
+                ;;
+            *)
+                [[ -z "$selector" ]] || { err "Лишний аргумент: $1"; return 1; }
+                selector="$1"; shift
+                ;;
+        esac
+    done
+    if [[ "$http" == true ]]; then
+        if [[ "$all" == true || -z "$selector" ]]; then
+            local id
+            id="$(active_id)"
+            [[ -n "$id" ]] || die "Активный сервер не выбран"
+            selector="$id"
+        fi
+        is_running || die "Xray не запущен — проверка через прокси недоступна"
+        resolve_xray
+        ping_server_http "$selector"
+        return $?
+    fi
+    if [[ "$all" == true || -z "$selector" || "$selector" == "all" ]]; then
+        ping_all_servers tcp
+        return $?
+    fi
+    ping_server_tcp "$selector"
+}
+
+cmd_fastest() {
+    resolve_xray
+    auto_select_fastest
+}
+
 cmd_tun() {
     local action="${1:-status}"
     local tun
@@ -174,9 +221,9 @@ cmd_tun() {
                 info "TUN уже включён"
                 return 0
             fi
+            ensure_sudo
             state_update '.settings.tun = true' || die "Не удалось сохранить настройку"
             if is_running; then
-                ensure_sudo
                 restart_xray
             else
                 ok "TUN включён. При запуске потребуется sudo."
@@ -187,9 +234,11 @@ cmd_tun() {
                 info "TUN уже выключен"
                 return 0
             fi
-            state_update '.settings.tun = false' || die "Не удалось сохранить настройку"
             if is_running; then
                 ensure_sudo
+            fi
+            state_update '.settings.tun = false' || die "Не удалось сохранить настройку"
+            if is_running; then
                 restart_xray
             else
                 tun_cleanup_routes || true
@@ -234,12 +283,19 @@ cmd_settings() {
     [[ "$action" == "set" ]] || { msg "Использование: $APP settings [show|set KEY VALUE]"; return 1; }
     local key="${2:-}" val="${3:-}"
     [[ -n "$key" ]] || die "Укажите ключ"
+    local old_settings out
+    old_settings="$(jq -c '.settings' "$STATE_FILE" 2>/dev/null)"
+    [[ -n "$old_settings" ]] || old_settings='{}'
     case "$key" in
         mixed_port|api_port)
             is_uint "$val" && (( val >= 1 && val <= 65535 )) || die "Порт 1..65535"
-            local other
+            local other current
             [[ "$key" == mixed_port ]] && other="$(setting_get api_port)" || other="$(setting_get mixed_port)"
             [[ "$val" != "$other" ]] || die "Порты не должны совпадать"
+            [[ "$key" == mixed_port ]] && current="$(setting_get mixed_port)" || current="$(setting_get api_port)"
+            if is_running && [[ "$val" != "$current" ]] && port_open 127.0.0.1 "$val"; then
+                die "Порт $val уже занят"
+            fi
             state_update ".settings.$key = \$v" --argjson v "$val" || die "Не удалось сохранить"
             ;;
         log_level)
@@ -255,7 +311,7 @@ cmd_settings() {
             state_update '.settings.tun = $v' --argjson v "$val" || die "Не удалось сохранить"
             ;;
         tun_name)
-            [[ "$val" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || die "Имя TUN: до 15 символов [A-Za-z0-9_.-]"
+            [[ "$val" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$ ]] || die "Имя TUN: до 15 символов [A-Za-z0-9_.-]"
             state_update '.settings.tun_name = $v' --arg v "$val" || die "Не удалось сохранить"
             ;;
         tun_mtu)
@@ -263,7 +319,7 @@ cmd_settings() {
             state_update '.settings.tun_mtu = $v' --argjson v "$val" || die "Не удалось сохранить"
             ;;
         tun_gateway)
-            [[ "$val" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] || die "Нужен IPv4 CIDR"
+            [[ "$val" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] && is_ipv4_cidr "$val" || die "Нужен IPv4 CIDR"
             state_update '.settings.tun_gateway = $v' --arg v "$val" || die "Не удалось сохранить"
             ;;
         tun_metric)
@@ -279,10 +335,16 @@ cmd_settings() {
             die "Неизвестный ключ: $key"
             ;;
     esac
-    generate_config quiet >/dev/null 2>&1 || warn "Конфиг не проверен; проверьте $APP gen"
+    if ! out="$(generate_config quiet 2>&1)"; then
+        state_update '.settings = $s' --argjson s "$old_settings" >/dev/null 2>&1 || true
+        generate_config quiet >/dev/null 2>&1 || true
+        err "Конфиг не прошёл проверку — изменение отменено"
+        printf '%s\n' "$out" | tail -n 5 >&2
+        return 1
+    fi
     ok "Сохранено: $key=$val"
     if is_running; then
-        warn "Изменение порта/TUN применится после: $APP restart"
+        warn "Изменение применится после: $APP restart"
     fi
 }
 
@@ -312,7 +374,7 @@ cmd_main() {
         version|-V|--version) printf '%s %s\n' "$APP" "$VERSION"; return 0 ;;
     esac
 
-    require_cmd jq base64 sha1sum flock
+    require_cmd jq base64 sha1sum flock timeout
     init_data
     case "$cmd" in
         tui|menu) tui_main ;;
@@ -337,15 +399,20 @@ cmd_main() {
             local lines=80 follow=""
             while (($# > 0)); do
                 case "$1" in
-                    -n) lines="${2:-80}"; shift 2 ;;
+                    -n|--lines)
+                        [[ $# -ge 2 ]] || die "После -n нужно число строк"
+                        [[ "$2" =~ ^[0-9]+$ ]] || die "Число строк должно быть целым: $2"
+                        lines="$2"; shift 2 ;;
                     -f|--follow) follow=follow; shift ;;
-                    *) shift ;;
+                    *) err "Неизвестный параметр: $1"; return 1 ;;
                 esac
             done
             show_log "$lines" "$follow" ;;
         api) cmd_api "$@" ;;
         tun) cmd_tun "$@" ;;
         settings|set) cmd_settings "$@" ;;
+        ping) cmd_ping "$@" ;;
+        fastest) cmd_fastest "$@" ;;
         sub|subs|subscription) cmd_sub "$@" ;;
         doctor|diag) doctor ;;
         migrate-legacy|migrate) migrate_legacy "${1:-}" ;;

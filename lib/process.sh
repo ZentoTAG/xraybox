@@ -204,9 +204,14 @@ start_xray() {
         tail -n 20 "$XRAY_LOG" 2>/dev/null | sed 's/^/  /' >&2 || true
         if kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
+            sleep 0.2
         fi
-        rm -f "$PID_FILE"
-        [[ "$tun" == "true" ]] && tun_cleanup_routes
+        # If sudo forked xray, killing sudo alone may leave the child behind.
+        if is_running; then
+            stop_xray quiet || true
+        fi
+        rm -f "$PID_FILE" "$PROC_FILE"
+        [[ "$tun" == "true" ]] && tun_cleanup_routes || true
         return 1
     fi
 
@@ -224,7 +229,7 @@ start_xray() {
 
     local active
     active="$(active_id)"
-    if [[ -z "$active" ]]; then
+    if [[ -z "$active" ]] || ! jq -e --arg id "$active" '.servers[] | select(.id == $id)' "$STATE_FILE" >/dev/null 2>&1; then
         active="$(jq -r '.servers[0].id' "$STATE_FILE")"
         state_update '.settings.active = $id' --arg id "$active" || true
     fi
@@ -271,10 +276,10 @@ stop_xray() {
     fi
     local i
     for ((i = 0; i < 50; i++)); do
-        kill -0 "$pid" 2>/dev/null || break
+        priv_run kill -0 "$pid" 2>/dev/null || break
         sleep 0.1
     done
-    if kill -0 "$pid" 2>/dev/null; then
+    if priv_run kill -0 "$pid" 2>/dev/null; then
         priv_run kill -KILL "$pid" 2>/dev/null || true
         sleep 0.3
     fi
@@ -370,17 +375,18 @@ doctor() {
     msg "${C_BOLD}$APP $VERSION — диагностика${C_RESET}"
     msg ""
 
-    local xray
-    if xray="$(command -v "$XRAY_BIN" 2>/dev/null || true)" && [[ -x "$xray" ]]; then
+    local xray=""
+    if [[ -x "$XRAY_BIN" ]]; then
+        xray="$XRAY_BIN"
         ok "Xray: $xray"
         msg "  $(xray_version)"
     else
-        err "Xray не найден: $XRAY_BIN"
+        err "Бинарник xray не найден в папке bin/. Скопируйте его туда вручную: $XRAY_BIN"
         failures=$((failures + 1))
     fi
 
     local c
-    for c in jq curl base64 sha1sum flock nohup ip ss gum; do
+    for c in jq curl base64 sha1sum flock nohup timeout ip ss gum; do
         if have "$c"; then
             ok "Команда: $c"
         else

@@ -73,6 +73,10 @@ parse_vless() {
     fi
 
     [[ -n "$host" ]] || { err "Некорректный VLESS-ключ: пустой адрес"; return 1; }
+    if [[ ! "$host" =~ ^[A-Za-z0-9._:%-]+$ ]]; then
+        err "Некорректный адрес сервера в ключе: $host"
+        return 1
+    fi
     [[ "$port" =~ ^[0-9]+$ ]] || { err "Некорректный порт: $port"; return 1; }
     (( port >= 1 && port <= 65535 )) || { err "Порт вне диапазона: $port"; return 1; }
 
@@ -126,6 +130,10 @@ parse_vless() {
         err "Неизвестный flow: $flow"
         return 1
     fi
+    if [[ -n "$flow" && "$security" == "none" ]]; then
+        err "flow=$flow требует security=tls или reality"
+        return 1
+    fi
     if [[ "$security" == reality && "$type" != tcp && "$type" != xhttp && "$type" != grpc ]]; then
         err "REALITY в Xray поддерживает только TCP/RAW, XHTTP и gRPC (у вас $type)."
         return 1
@@ -162,11 +170,19 @@ parse_vless() {
         [[ -z "$path" ]] && path="/"
         [[ -z "$mode" ]] && mode=""
     elif [[ "$type" == grpc ]]; then
-        [[ "$mode" == multi ]] || mode=""
+        case "$mode" in
+            ""|gun) mode="" ;;
+            multi) ;;
+            *) err "Некорректный gRPC mode=$mode (gun|multi)"; return 1 ;;
+        esac
         path=""
     elif [[ "$type" == tcp ]]; then
         [[ -z "$header_type" ]] && header_type=none
         header_type="${header_type,,}"
+        case "$header_type" in
+            none|http) ;;
+            *) err "Некорректный headerType=$header_type (none|http)"; return 1 ;;
+        esac
     fi
 
     extra_raw="$(uri_q "$query" extra)"
@@ -182,7 +198,13 @@ parse_vless() {
     allow_insecure_raw="$(uri_q "$query" allowInsecure)"
     [[ -z "$allow_insecure_raw" ]] && allow_insecure_raw="$(uri_q "$query" insecure)"
     case "${allow_insecure_raw,,}" in
-        1|true|yes) allow_insecure=true ;;
+        1|true|yes)
+            allow_insecure=true
+            # Xray 26 removed allowInsecure; emitting it makes the whole config
+            # invalid. Keep the key importable and warn instead.
+            warn "allowInsecure=1 не поддерживается Xray 26 — ключ импортируется без этой опции"
+            allow_insecure=false
+            ;;
     esac
 
     pcs="$(uri_q "$query" pcs)"
@@ -198,17 +220,30 @@ parse_vless() {
             err "Для REALITY нужен параметр pbk (public key)"
             return 1
         fi
+        if [[ ! "$public_key" =~ ^[A-Za-z0-9_-]{43}=?$ ]]; then
+            err "Некорректный REALITY public key (pbk): ожидается 43 символа base64url"
+            return 1
+        fi
+        if [[ -n "$short_id" && ! "$short_id" =~ ^[0-9A-Fa-f]{1,16}$ ]]; then
+            err "Некорректный REALITY shortId (sid): до 16 hex-символов"
+            return 1
+        fi
         if [[ -z "$sni" ]]; then
             sni="$host"
         fi
     elif [[ "$security" == tls ]]; then
         [[ -z "$sni" ]] && sni="$host"
+        if [[ -n "$pcs" && ! "$pcs" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+            err "Некорректный pcs: ожидается SHA-256 в hex (64 символа)"
+            return 1
+        fi
     fi
 
     name=""
     if [[ -n "$frag" ]]; then
         name="$(url_decode "$frag")"
     fi
+    name="$(sanitize_text "$name")"
     name="$(trim "$name")"
     [[ -z "$name" ]] && name="$host:$port"
 

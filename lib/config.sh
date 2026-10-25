@@ -10,24 +10,42 @@ build_outbound() {
 validate_config_file() {
     # validate_config_file <file> [quiet]
     local file="$1" quiet="${2:-}"
-    local testfile="$file" tmp=""
+    local tmp="" out2 rc2=0
     local out rc=0
     resolve_xray
 
-    # `xray run -test` actually creates a TUN device. Without root this always
-    # fails with EPERM, so validate the rest of the config without the TUN
-    # inbound and let `start` (with sudo) do the real check.
-    if [[ "$(setting_get tun)" == "true" ]] && ! is_root; then
-        tmp="$(mktemp "$DATA_DIR/.config-test.XXXXXX.json")"
-        jq 'del(.inbounds[] | select(.tag == "tun-in"))' "$file" >"$tmp" || {
-            rm -f "$tmp"
-            return 1
-        }
-        testfile="$tmp"
+    out="$(timeout 30 "$XRAY_BIN" run -test -c "$file" 2>&1)" || rc=$?
+    if (( rc == 124 )); then
+        err "Проверка конфига Xray не завершилась за 30 секунд"
+        return 1
     fi
 
-    out="$("$XRAY_BIN" run -test -c "$testfile" 2>&1)" || rc=$?
-    [[ -n "$tmp" ]] && rm -f "$tmp"
+    # `xray run -test` actually creates a TUN device and fails with EPERM for a
+    # normal user. If that is the *only* problem, re-check the rest of the
+    # config without the TUN inbound. This still validates all TUN settings,
+    # because Xray parses them before trying to create the interface.
+    if (( rc != 0 )) && [[ "$(setting_get tun)" == "true" ]] && ! is_root \
+        && grep -qiE 'operation not permitted|permission denied|failed to create (virtual )?tun|TUNSETIFF|/dev/net/tun' <<<"$out"; then
+        tmp="$(mktemp "$DATA_DIR/.config-test.XXXXXX.json")" || return 1
+        if ! jq 'del(.inbounds[] | select(.tag == "tun-in"))' "$file" >"$tmp"; then
+            rm -f "$tmp"
+            err "Не удалось подготовить конфиг без TUN для проверки"
+            return 1
+        fi
+        out2="$(timeout 30 "$XRAY_BIN" run -test -c "$tmp" 2>&1)" || rc2=$?
+        rm -f "$tmp"
+        if (( rc2 == 124 )); then
+            err "Проверка конфига без TUN не завершилась за 30 секунд"
+            return 1
+        fi
+        if (( rc2 == 0 )); then
+            rc=0
+        else
+            out="$out2"
+            rc="$rc2"
+        fi
+    fi
+
     if (( rc != 0 )); then
         err "Xray отверг конфиг:"
         printf '%s\n' "$out" | tail -n 25 >&2
@@ -64,11 +82,11 @@ generate_config() {
     (( mixed_port != api_port )) || { err "mixed_port и api_port не должны совпадать"; return 1; }
     [[ "$log_level" =~ ^(debug|info|warning|error|none)$ ]] \
         || { err "Некорректный log_level: $log_level"; return 1; }
-    [[ "$tun_name" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] \
+    [[ "$tun_name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$ ]] \
         || { err "Некорректное имя TUN-интерфейса: $tun_name (до 15 символов)"; return 1; }
     is_uint "$tun_mtu" && (( tun_mtu >= 576 && tun_mtu <= 65535 )) \
         || { err "Некорректный TUN MTU: $tun_mtu"; return 1; }
-    [[ "$tun_gateway" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] \
+    is_ipv4_cidr "$tun_gateway" \
         || { err "Некорректный tun_gateway (нужен IPv4 CIDR): $tun_gateway"; return 1; }
     is_uint "$tun_metric" || { err "Некорректный tun_metric: $tun_metric"; return 1; }
     jq -e 'type == "array" and all(.[]; type == "string")' <<<"$direct_domains" >/dev/null \

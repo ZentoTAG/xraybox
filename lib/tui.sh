@@ -59,7 +59,9 @@ tui_pause() {
 }
 
 tui_choose_server_prompt() {
-    # Вспомогательная функция выбора сервера с видимым списком
+    # Вспомогательная функция выбора сервера: список отсортирован по пингу,
+    # но номера остаются «постоянными» (индекс в state.json), чтобы `use N`
+    # работал предсказуемо и после сортировки.
     local header="$1"
     local n active labels=() srv i selection idx
     n="$(server_count)"
@@ -68,17 +70,18 @@ tui_choose_server_prompt() {
         return 1
     fi
     active="$(active_id)"
-    for ((i = 1; i <= n; i++)); do
-        srv="$(jq -c --argjson i "$((i - 1))" '.servers[$i]' "$STATE_FILE")"
+    while IFS=$'\t' read -r i srv; do
+        [[ -n "$srv" ]] || continue
         labels+=("$(server_label "$srv" "$i" "$active")")
-    done
+    done < <(servers_sorted | jq -r '[.idx, (.srv | tojson)] | @tsv')
     labels+=("← Назад")
 
     selection="$(gum choose \
-        --header "$header (↑/↓ — навигация, / — поиск, Enter — выбор)" \
-        --height 20 \
+        --header "$header · ↑/↓ — выбор, / — поиск, Enter — ОК, Esc — назад" \
+        --height 22 \
         --cursor "› " \
         --cursor.foreground "212" \
+        --header.foreground "99" \
         --item.foreground "252" \
         --selected.foreground "212" \
         "${labels[@]}")" || return 1
@@ -89,21 +92,59 @@ tui_choose_server_prompt() {
     printf '%s' "$idx"
 }
 
-tui_pick_server() {
-    # Автоматически пингуем все серверы в фоне перед открытием списка (занимает ~1 сек)
-    ( ping_all_servers tcp >/dev/null 2>&1 ) &
-
-    local idx
-    idx="$(tui_choose_server_prompt "Выберите сервер (пинги обновлены в фоне)")" || return 0
-    if ! (use_server "$idx"); then
-        tui_pause
-        return 0
-    fi
+tui_maybe_start_xray() {
     if ! is_running; then
         if gum confirm --affirmative "Запустить" --negative "Позже" "Xray не запущен. Запустить сейчас?"; then
             (start_xray) || true
         fi
     fi
+}
+
+tui_pick_server() {
+    local have_pings
+    have_pings="$(jq '[.servers[] | select((.ping // null) != null)] | length' "$STATE_FILE" 2>/dev/null)"
+    if [[ "${have_pings:-0}" == "0" ]]; then
+        tui_clear
+        (ping_all_servers tcp quiet) || true
+    fi
+
+    local idx
+    idx="$(tui_choose_server_prompt "Выберите сервер (сортировка по пингу)")" || return 0
+    if ! (use_server "$idx"); then
+        tui_pause
+        return 0
+    fi
+    tui_maybe_start_xray
+    tui_pause
+}
+
+tui_ping_all() {
+    tui_clear
+    (ping_all_servers tcp) || true
+    tui_pause
+}
+
+tui_ping_active_http() {
+    tui_clear
+    local id
+    id="$(active_id)"
+    if [[ -z "$id" ]]; then
+        ui_warn "Активный сервер не выбран."
+    elif ! is_running; then
+        ui_warn "Для реальной проверки через туннель сначала запустите Xray."
+    else
+        (ping_server_http "$id") || true
+    fi
+    tui_pause
+}
+
+tui_auto_fastest() {
+    tui_clear
+    if ! (auto_select_fastest); then
+        tui_pause
+        return 0
+    fi
+    tui_maybe_start_xray
     tui_pause
 }
 
@@ -162,8 +203,9 @@ tui_server_menu() {
         local choice
         if ! choice="$(tui_menu "Серверы" \
             "Выбрать / переключить сервер" \
-            "Проверить пинг всех серверов (быстро, TCP)" \
-            "Проверить реальный отклик через Xray (HTTP 204)" \
+            "Автоматически выбрать самый быстрый" \
+            "Проверить пинг всех (TCP)" \
+            "Проверить активный сервер через Xray (HTTP)" \
             "Добавить ключ" \
             "Импорт из файла" \
             "Удалить сервер" \
@@ -173,20 +215,9 @@ tui_server_menu() {
         fi
         case "$choice" in
             "Выбрать / переключить сервер") tui_pick_server ;;
-            "Проверить пинг всех серверов (быстро, TCP)")
-                tui_clear
-                (ping_all_servers tcp) || true
-                tui_pause
-                ;;
-            "Проверить реальный отклик через Xray (HTTP 204)")
-                tui_clear
-                if ! is_running; then
-                    ui_warn "Для реальной проверки через туннель сначала запустите Xray."
-                else
-                    (ping_all_servers xray) || true
-                fi
-                tui_pause
-                ;;
+            "Автоматически выбрать самый быстрый") tui_auto_fastest ;;
+            "Проверить пинг всех (TCP)") tui_ping_all ;;
+            "Проверить активный сервер через Xray (HTTP)") tui_ping_active_http ;;
             "Добавить ключ") tui_add_key ;;
             "Импорт из файла") tui_import_file ;;
             "Удалить сервер") tui_remove_server ;;
@@ -290,6 +321,9 @@ tui_tun() {
             if gum confirm --affirmative "Перезапустить" --negative "Позже" "Для применения TUN нужен перезапуск Xray. Сделать сейчас?"; then
                 (restart_xray) || true
             fi
+        else
+            (tun_cleanup_routes) || true
+            ui_ok "TUN выключен"
         fi
     else
         ui_warn "TUN в Xray требует root/sudo и меняет системный default route."
@@ -327,18 +361,32 @@ tui_settings() {
             "Назад")"; then
             return 0
         fi
-        local val old changed=false
+        local val old changed=false other old_settings out
+        old_settings="$(jq -c '.settings' "$STATE_FILE" 2>/dev/null)"
+        [[ -n "$old_settings" ]] || old_settings='{}'
         case "$choice" in
             "Mixed-порт")
                 old="$(setting_get mixed_port)"
+                other="$(setting_get api_port)"
                 val="$(gum input --header "Mixed HTTP/SOCKS порт" --value "$old" --width 20)" || continue
+                val="$(trim "$val")"
                 is_uint "$val" && (( val > 0 && val < 65536 )) || { ui_err "Некорректный порт"; tui_pause; continue; }
+                [[ "$val" != "$other" ]] || { ui_err "Порт совпадает с API-портом"; tui_pause; continue; }
+                if is_running && [[ "$val" != "$old" ]] && port_open 127.0.0.1 "$val"; then
+                    ui_err "Порт $val уже занят"; tui_pause; continue
+                fi
                 state_update '.settings.mixed_port = $v' --argjson v "$val" && changed=true
                 ;;
             "API-порт")
                 old="$(setting_get api_port)"
+                other="$(setting_get mixed_port)"
                 val="$(gum input --header "Xray API порт" --value "$old" --width 20)" || continue
+                val="$(trim "$val")"
                 is_uint "$val" && (( val > 0 && val < 65536 )) || { ui_err "Некорректный порт"; tui_pause; continue; }
+                [[ "$val" != "$other" ]] || { ui_err "Порт совпадает с Mixed-портом"; tui_pause; continue; }
+                if is_running && [[ "$val" != "$old" ]] && port_open 127.0.0.1 "$val"; then
+                    ui_err "Порт $val уже занят"; tui_pause; continue
+                fi
                 state_update '.settings.api_port = $v' --argjson v "$val" && changed=true
                 ;;
             "Уровень логов")
@@ -359,9 +407,17 @@ tui_settings() {
                 name="$(setting_get tun_name)"; mtu="$(setting_get tun_mtu)"
                 gw="$(setting_get tun_gateway)"; metric="$(setting_get tun_metric)"
                 name="$(gum input --header "Имя TUN-интерфейса (до 15 симв.)" --value "$name" --width 30)" || continue
-                mtu="$(gum input --header "MTU" --value "$mtu" --width 12)" || continue
-                gw="$(gum input --header "Gateway CIDR" --value "$gw" --width 30)" || continue
+                name="$(trim "$name")"
+                [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$ ]] || { ui_err "Имя TUN: до 15 символов [A-Za-z0-9_.-]"; tui_pause; continue; }
+                mtu="$(gum input --header "MTU (576..65535)" --value "$mtu" --width 12)" || continue
+                mtu="$(trim "$mtu")"
+                is_uint "$mtu" && (( mtu >= 576 && mtu <= 65535 )) || { ui_err "MTU должен быть 576..65535"; tui_pause; continue; }
+                gw="$(gum input --header "Gateway CIDR (IPv4)" --value "$gw" --width 30)" || continue
+                gw="$(trim "$gw")"
+                [[ "$gw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] && is_ipv4_cidr "$gw" || { ui_err "Нужен IPv4 CIDR, например 172.19.0.1/30"; tui_pause; continue; }
                 metric="$(gum input --header "Metric default route" --value "$metric" --width 12)" || continue
+                metric="$(trim "$metric")"
+                is_uint "$metric" || { ui_err "Metric должен быть числом"; tui_pause; continue; }
                 state_update '.settings.tun_name=$n | .settings.tun_mtu=$m | .settings.tun_gateway=$g | .settings.tun_metric=$x' \
                     --arg n "$name" --argjson m "$mtu" --arg g "$gw" --argjson x "$metric" && changed=true
                 ;;
@@ -375,10 +431,14 @@ tui_settings() {
             "Назад") return 0 ;;
         esac
         if [[ "$changed" == true ]]; then
-            if generate_config quiet >/dev/null 2>&1; then
+            if out="$(generate_config quiet 2>&1)"; then
                 ui_ok "Настройки сохранены"
             else
-                ui_err "Настройки сохранены, но конфиг не прошёл проверку"
+                # Never leave state.json with settings that Xray rejects.
+                state_update '.settings = $s' --argjson s "$old_settings" >/dev/null 2>&1 || true
+                generate_config quiet >/dev/null 2>&1 || true
+                ui_err "Конфиг не прошёл проверку — изменения отменены"
+                printf '%s\n' "$out" | tail -n 5 >&2
             fi
             if is_running; then
                 if gum confirm --affirmative "Перезапустить" --negative "Позже" "Перезапустить Xray для применения?"; then
@@ -403,10 +463,12 @@ tui_status() {
 tui_log() {
     tui_clear
     if [[ -f "$XRAY_LOG" ]]; then
-        if have gum; then
-            show_log 300 | gum pager --height 25 2>/dev/null || show_log 120
+        local content
+        content="$(show_log 300)"
+        if have gum && [[ -t 1 ]]; then
+            printf '%s\n' "$content" | gum pager --height 25 2>/dev/null || true
         else
-            show_log 120
+            printf '%s\n' "$content"
         fi
     else
         ui_warn "Журнал пока пуст"
@@ -419,7 +481,13 @@ tui_config() {
     (config_summary) || true
     msg ""
     ui_warn "Ниже — конфиг без UUID/ключей."
-    (config_redacted) | gum pager --height 25 2>/dev/null || (config_redacted) | head -n 100
+    local content
+    content="$(config_redacted)"
+    if have gum && [[ -t 1 ]]; then
+        printf '%s\n' "$content" | gum pager --height 25 2>/dev/null || true
+    else
+        printf '%s\n' "$content" | head -n 100
+    fi
     tui_pause
 }
 

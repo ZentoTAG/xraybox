@@ -18,9 +18,8 @@ XRAY_LOG="$LOG_DIR/xray.log"
 LOCK_FILE="$DATA_DIR/.lock"
 TUN_STATE_FILE="$DATA_DIR/tun-routes.json"
 
-# Default path from the user's v2rayN install; can be overridden.
-DEFAULT_XRAY="$HOME/data/tools/v2rayN-linux-64/bin/xray/xray"
-XRAY_BIN="${XRAYBOX_XRAY:-$DEFAULT_XRAY}"
+# Xray is fully self-contained: only the copy inside xraybox/bin is used.
+XRAY_BIN="$ROOT_DIR/bin/xray"
 
 # Populated by resolve_xray.
 XRAY_VERSION=""
@@ -124,6 +123,12 @@ trim() {
     printf '%s' "$s"
 }
 
+sanitize_text() {
+    # Remove control bytes (including newlines/tabs/ESC) from untrusted names
+    # so a malicious subscription cannot break the TUI or inject escapes.
+    printf '%s' "$1" | tr '\000-\037\177' ' ' | sed 's/  */ /g'
+}
+
 json_escape() {
     jq -Rn --arg s "$1" '$s'
 }
@@ -170,6 +175,20 @@ human_ts() {
 }
 
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+is_ipv4_cidr() {
+    local cidr="$1" ip prefix a b c d
+    [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || return 1
+    ip="${cidr%/*}"
+    prefix="${cidr##*/}"
+    (( prefix <= 32 )) || return 1
+    IFS=. read -r a b c d <<<"$ip"
+    local o
+    for o in "$a" "$b" "$c" "$d"; do
+        is_uint "$o" && (( o <= 255 )) || return 1
+    done
+    return 0
+}
 
 is_root() { (( EUID == 0 )); }
 
@@ -228,9 +247,7 @@ resolve_xray() {
     if [[ -x "$XRAY_BIN" ]]; then
         return 0
     fi
-    XRAY_BIN="$(command -v xray 2>/dev/null || true)"
-    [[ -n "$XRAY_BIN" && -x "$XRAY_BIN" ]] || die \
-        "Xray не найден. Укажите путь: XRAYBOX_XRAY=/path/to/xray $APP ..."
+    die "Бинарник xray не найден в папке bin/. Скопируйте его туда вручную"
 }
 
 xray_version() {
@@ -242,7 +259,7 @@ xray_version() {
 }
 
 require_runtime() {
-    require_cmd jq curl base64 sha1sum flock
+    require_cmd jq curl base64 sha1sum flock timeout
     resolve_xray
 }
 
@@ -291,7 +308,7 @@ state_update() {
     init_data
     local tmp
     exec 9>"$LOCK_FILE" || return 1
-    flock -x 9 || { exec 9>&-; return 1; }
+    flock -x -w 15 9 || { exec 9>&-; return 1; }
     tmp="$(mktemp "$DATA_DIR/.state.XXXXXX")" || { exec 9>&-; return 1; }
     if jq "$@" "$filter" "$STATE_FILE" >"$tmp"; then
         chmod 600 "$tmp"
@@ -309,7 +326,7 @@ state_write() {
     init_data
     local json="$1" tmp
     exec 9>"$LOCK_FILE" || return 1
-    flock -x 9 || { exec 9>&-; return 1; }
+    flock -x -w 15 9 || { exec 9>&-; return 1; }
     tmp="$(mktemp "$DATA_DIR/.state.XXXXXX")" || { exec 9>&-; return 1; }
     if printf '%s\n' "$json" | jq -e . >"$tmp"; then
         chmod 600 "$tmp"
@@ -366,18 +383,40 @@ server_label() {
         mark="●"
     fi
 
-    if [[ -z "$ping_ms" ]]; then
-        ping_str="  —   "
+    if [[ ! "$ping_ms" =~ ^-?[0-9]+$ ]]; then
+        ping_str="—"
     elif (( ping_ms <= 0 )); then
-        ping_str="✗ недоступен"
+        ping_str="✗"
     else
         ping_str="${ping_ms} ms"
     fi
 
     local prefix=""
     [[ -n "$idx" ]] && prefix="$(printf '%2s. ' "$idx")"
-    printf '%s[%s] %-36s  %-10s  %-13s  %s:%s' \
+    printf '%s[%s] %-34s %9s  %-16s  %s:%s' \
         "$prefix" "$mark" "$name" "$ping_str" "[$transport/$security]" "$host" "$port"
+}
+
+servers_sorted() {
+    # Prints {"idx": <1-based index in state>, "srv": {...}} in ping order:
+    # reachable servers first (fastest to slowest), then not-yet-checked,
+    # then unreachable (ping == 0).
+    jq -c '
+        def pingnum:
+            (.ping // null) as $p
+            | if ($p | type) == "number" then $p
+              elif ($p | type) == "string" then ($p | tonumber? // null)
+              else null end;
+        .servers
+        | to_entries
+        | map({idx: (.key + 1), srv: .value})
+        | sort_by(.srv |
+            pingnum as $p
+            | if $p == null then [1, 0]
+              elif $p > 0 then [0, $p]
+              else [2, 0] end)
+        | .[]
+    ' "$STATE_FILE" 2>/dev/null
 }
 
 resolve_server() {
@@ -399,6 +438,9 @@ resolve_server() {
         if length == 1 then .[0] else empty end
     ' "$STATE_FILE")"
     if [[ -n "$match" ]]; then printf '%s\n' "$match"; return 0; fi
+    local id_matches
+    id_matches="$(jq -r --arg s "$sel" '[.servers[] | select(.id | startswith($s))] | length' "$STATE_FILE" 2>/dev/null)"
+    [[ "$id_matches" =~ ^[0-9]+$ ]] && (( id_matches > 1 )) && return 2
     match="$(jq -c --arg s "$sel" '
         [.servers[] | select(.name == $s)] |
         if length == 1 then .[0] else empty end
@@ -440,12 +482,13 @@ list_servers() {
         msg "Серверов пока нет. Добавьте ключ: $APP add 'vless://...'"
         return 0
     fi
-    printf '%s\n' "${C_DIM}   #  имя                              транспорт      адрес${C_RESET}"
-    for ((i = 1; i <= n; i++)); do
-        srv="$(jq -c --argjson i "$((i - 1))" '.servers[$i]' "$STATE_FILE")"
+    printf '%s\n' "${C_DIM}   #  ст имя                                пинг       транспорт         адрес${C_RESET}"
+    while IFS=$'\t' read -r i srv; do
+        [[ -n "$srv" ]] || continue
         server_label "$srv" "$i" "$active"
         printf '\n'
-    done
+    done < <(servers_sorted | jq -r '[.idx, (.srv | tojson)] | @tsv')
+    printf '%s\n' "${C_DIM}● активный · ✗ нет ответа на TCP-пинге · — пинг ещё не проверялся${C_RESET}"
 }
 
 # ---------------------------------------------------------------------------
@@ -453,10 +496,10 @@ list_servers() {
 # ---------------------------------------------------------------------------
 
 fetch_url() {
-    local url="$1" out err
+    local url="$1" out
     local errfile
-    errfile="$(mktemp "$DATA_DIR/.curl.XXXXXX")"
-    if out="$(curl -fsSL --compressed --max-time 30 --retry 2 \
+    errfile="$(mktemp "$DATA_DIR/.curl.XXXXXX")" || { err "Не удалось создать временный файл"; return 1; }
+    if out="$(curl -fsSL --compressed --connect-timeout 8 --max-time 20 --retry 1 --retry-delay 1 --retry-max-time 25 \
         --user-agent "$APP/$VERSION" --max-filesize 5242880 \
         "$url" 2>"$errfile")"; then
         rm -f "$errfile"
@@ -466,7 +509,7 @@ fetch_url() {
     local detail
     detail="$(tr '\n' ' ' <"$errfile" | cut -c1-300)"
     rm -f "$errfile"
-    err "Не удалось скачать подписку $(mask_url "$url"): $detail"
+    err "Не удалось скачать подписку $(mask_url "$url"): ${detail:-таймаут или пустой ответ}"
     return 1
 }
 
