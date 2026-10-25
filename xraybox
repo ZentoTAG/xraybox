@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# xraybox — TUI/CLI менеджер Xray с поддержкой VLESS/XHTTP/REALITY.
+set -uo pipefail
+
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SELF_DIR/lib/common.sh"
+# shellcheck source=lib/uri.sh
+source "$SELF_DIR/lib/uri.sh"
+# shellcheck source=lib/outbound.jq
+# shellcheck source=lib/config.sh
+source "$SELF_DIR/lib/config.sh"
+# shellcheck source=lib/servers.sh
+source "$SELF_DIR/lib/servers.sh"
+# shellcheck source=lib/process.sh
+source "$SELF_DIR/lib/process.sh"
+# shellcheck source=lib/tui.sh
+source "$SELF_DIR/lib/tui.sh"
+
+usage() {
+    cat <<EOF
+${C_BOLD}xraybox $VERSION${C_RESET} — менеджер Xray (VLESS / XHTTP / REALITY)
+
+Использование:
+  $APP                      открыть TUI
+  $APP tui                  открыть TUI
+  $APP add 'vless://…'      добавить один или несколько ключей
+  $APP add --file FILE      импортировать ключи/подписку из файла
+  $APP list                 список серверов
+  $APP use N|ID|ИМЯ         переключить сервер (на лету, через Xray API)
+  $APP rm N|ID|ИМЯ [--yes]  удалить сервер
+  $APP rename N|ID "Имя"    переименовать сервер
+
+  $APP start | stop | restart | status
+  $APP gen [--check]        сгенерировать/проверить config.json
+  $APP log [-n N] [-f]      журнал Xray
+  $APP api status|outbounds|switch N
+  $APP tun on|off|toggle|status
+  $APP settings [show|set KEY VALUE]
+  $APP sub add URL [--name NAME]
+  $APP sub update [all|ID|ИМЯ]
+  $APP sub list | sub rm ID|ИМЯ
+  $APP doctor               диагностика
+  $APP migrate-legacy [FILE] перенести данные старого xraybox
+  $APP version              версия
+
+Переменные:
+  XRAYBOX_XRAY   путь к Xray (по умолчанию $DEFAULT_XRAY)
+  XRAYBOX_HOME   каталог данных (по умолчанию $ROOT_DIR/data)
+
+TUN требует root/sudo. Mixed-прокси по умолчанию 127.0.0.1:12080,
+API — 127.0.0.1:10085. Секреты хранятся в state.json (chmod 600).
+EOF
+}
+
+cmd_add() {
+    local file="" text="" arg
+    while (($# > 0)); do
+        case "$1" in
+            --file|-f)
+                file="${2:-}"
+                [[ -n "$file" ]] || die "Нужен путь после --file"
+                shift 2
+                ;;
+            --help|-h)
+                msg "Использование: $APP add 'vless://…' | $APP add --file FILE"
+                return 0
+                ;;
+            *)
+                arg="$1"; shift
+                [[ -n "$text" ]] && text+=$'\n'
+                text+="$arg"
+                ;;
+        esac
+    done
+
+    resolve_xray
+    require_cmd jq curl base64 sha1sum
+    if [[ -n "$file" ]]; then
+        add_from_file "$file" manual
+        return $?
+    fi
+    if [[ -z "$text" ]]; then
+        if [[ ! -t 0 ]]; then
+            text="$(cat)"
+        else
+            die "Укажите ключ vless:// или используйте --file"
+        fi
+    fi
+    [[ -n "$(trim "$text")" ]] || die "Пустой ввод"
+    import_uri_text "$text" manual
+}
+
+cmd_sub() {
+    local action="${1:-}"; shift || true
+    case "$action" in
+        add)
+            local url="" name=""
+            while (($# > 0)); do
+                case "$1" in
+                    --name)
+                        name="${2:-}"; shift 2 ;;
+                    *)
+                        [[ -z "$url" ]] && url="$1" || die "Лишний аргумент: $1"
+                        shift ;;
+                esac
+            done
+            [[ -n "$url" ]] || die "Использование: $APP sub add URL [--name NAME]"
+            resolve_xray
+            subscription_add "$url" "$name"
+            ;;
+        update)
+            local selector="${1:-all}"
+            resolve_xray
+            if [[ "$selector" == "all" ]]; then
+                subscription_update_all
+            else
+                subscription_update_one "$selector"
+            fi
+            ;;
+        list|ls)
+            subscription_list
+            ;;
+        rm|remove|del)
+            local selector="${1:-}"
+            [[ -n "$selector" ]] || die "Укажите ID или имя подписки"
+            subscription_remove "$selector"
+            ;;
+        *)
+            msg "Использование: $APP sub add|update|list|rm"
+            return 1
+            ;;
+    esac
+}
+
+cmd_api() {
+    local action="${1:-status}"; shift || true
+    resolve_xray
+    case "$action" in
+        status)
+            api_status
+            ;;
+        outbounds)
+            is_running || die "Xray не запущен"
+            local port
+            port="$(setting_get api_port)"; [[ -n "$port" ]] || port=10085
+            timeout 8 "$XRAY_BIN" api lso -s "127.0.0.1:$port" \
+                | jq -r '.outbounds[] | "\(.tag)  \(.proxySettings._TypedMessage_ // "?")"'
+            ;;
+        switch|use)
+            [[ -n "${1:-}" ]] || die "Укажите сервер: $APP api switch N"
+            use_server "$1"
+            ;;
+        bi)
+            is_running || die "Xray не запущен"
+            local port
+            port="$(setting_get api_port)"; [[ -n "$port" ]] || port=10085
+            timeout 8 "$XRAY_BIN" api bi -s "127.0.0.1:$port" active
+            ;;
+        *)
+            msg "Использование: $APP api status|outbounds|switch N|bi"
+            return 1
+            ;;
+    esac
+}
+
+cmd_tun() {
+    local action="${1:-status}"
+    local tun
+    tun="$(setting_get tun)"; [[ "$tun" == "true" ]] || tun=false
+    case "$action" in
+        on|enable)
+            if [[ "$tun" == "true" ]]; then
+                info "TUN уже включён"
+                return 0
+            fi
+            state_update '.settings.tun = true' || die "Не удалось сохранить настройку"
+            if is_running; then
+                ensure_sudo
+                restart_xray
+            else
+                ok "TUN включён. При запуске потребуется sudo."
+            fi
+            ;;
+        off|disable)
+            if [[ "$tun" != "true" ]]; then
+                info "TUN уже выключен"
+                return 0
+            fi
+            state_update '.settings.tun = false' || die "Не удалось сохранить настройку"
+            if is_running; then
+                ensure_sudo
+                restart_xray
+            else
+                tun_cleanup_routes || true
+                ok "TUN выключен"
+            fi
+            ;;
+        toggle)
+            if [[ "$tun" == "true" ]]; then cmd_tun off; else cmd_tun on; fi
+            ;;
+        status)
+            printf 'TUN: %s\n' "$([[ "$tun" == true ]] && echo вкл || echo выкл)"
+            printf 'Имя: %s   MTU: %s   Gateway: %s   Metric: %s\n' \
+                "$(setting_get tun_name)" "$(setting_get tun_mtu)" \
+                "$(setting_get tun_gateway)" "$(setting_get tun_metric)"
+            printf 'Default interface: %s\n' "$(default_iface || echo '—')"
+            if [[ -f "$TUN_STATE_FILE" ]]; then
+                printf 'Активные маршруты: %s\n' "$(cat "$TUN_STATE_FILE")"
+            fi
+            if is_root; then
+                msg "Права: root"
+            elif sudo -n true 2>/dev/null; then
+                msg "Права: sudo без пароля"
+            elif have sudo; then
+                msg "Права: sudo (спросит пароль)"
+            else
+                msg "Права: нет sudo — TUN недоступен"
+            fi
+            ;;
+        *)
+            msg "Использование: $APP tun on|off|toggle|status"
+            return 1
+            ;;
+    esac
+}
+
+cmd_settings() {
+    local action="${1:-show}"
+    if [[ "$action" == "show" ]]; then
+        jq '.settings' "$STATE_FILE"
+        return 0
+    fi
+    [[ "$action" == "set" ]] || { msg "Использование: $APP settings [show|set KEY VALUE]"; return 1; }
+    local key="${2:-}" val="${3:-}"
+    [[ -n "$key" ]] || die "Укажите ключ"
+    case "$key" in
+        mixed_port|api_port)
+            is_uint "$val" && (( val >= 1 && val <= 65535 )) || die "Порт 1..65535"
+            local other
+            [[ "$key" == mixed_port ]] && other="$(setting_get api_port)" || other="$(setting_get mixed_port)"
+            [[ "$val" != "$other" ]] || die "Порты не должны совпадать"
+            state_update ".settings.$key = \$v" --argjson v "$val" || die "Не удалось сохранить"
+            ;;
+        log_level)
+            [[ "$val" =~ ^(debug|info|warning|error|none)$ ]] || die "log_level: debug|info|warning|error|none"
+            state_update '.settings.log_level = $v' --arg v "$val" || die "Не удалось сохранить"
+            ;;
+        allow_lan)
+            case "$val" in 1|true|yes) val=true ;; 0|false|no) val=false ;; *) die "allow_lan: true|false" ;; esac
+            state_update '.settings.allow_lan = $v' --argjson v "$val" || die "Не удалось сохранить"
+            ;;
+        tun)
+            case "$val" in 1|true|yes) val=true ;; 0|false|no) val=false ;; *) die "tun: true|false" ;; esac
+            state_update '.settings.tun = $v' --argjson v "$val" || die "Не удалось сохранить"
+            ;;
+        tun_name)
+            [[ "$val" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || die "Имя TUN: до 15 символов [A-Za-z0-9_.-]"
+            state_update '.settings.tun_name = $v' --arg v "$val" || die "Не удалось сохранить"
+            ;;
+        tun_mtu)
+            is_uint "$val" && (( val >= 576 && val <= 65535 )) || die "MTU 576..65535"
+            state_update '.settings.tun_mtu = $v' --argjson v "$val" || die "Не удалось сохранить"
+            ;;
+        tun_gateway)
+            [[ "$val" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] || die "Нужен IPv4 CIDR"
+            state_update '.settings.tun_gateway = $v' --arg v "$val" || die "Не удалось сохранить"
+            ;;
+        tun_metric)
+            is_uint "$val" || die "metric — число"
+            state_update '.settings.tun_metric = $v' --argjson v "$val" || die "Не удалось сохранить"
+            ;;
+        direct_domains)
+            local arr
+            arr="$(jq -cn --arg s "$val" '$s | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length>0))')"
+            state_update '.settings.direct_domains = $a' --argjson a "$arr" || die "Не удалось сохранить"
+            ;;
+        *)
+            die "Неизвестный ключ: $key"
+            ;;
+    esac
+    generate_config quiet >/dev/null 2>&1 || warn "Конфиг не проверен; проверьте $APP gen"
+    ok "Сохранено: $key=$val"
+    if is_running; then
+        warn "Изменение порта/TUN применится после: $APP restart"
+    fi
+}
+
+cmd_rm() {
+    local selector="" yes=false
+    while (($# > 0)); do
+        case "$1" in
+            --yes|-y) yes=true; shift ;;
+            *) selector="${selector:-$1}"; shift ;;
+        esac
+    done
+    [[ -n "$selector" ]] || die "Укажите номер, id или имя сервера"
+    if [[ "$yes" != true && -t 0 ]]; then
+        local srv
+        srv="$(resolve_server_or_die "$selector")" || return 1
+        confirm "Удалить «$(jq -r '.name' <<<"$srv")»?" || return 0
+    fi
+    remove_server "$selector"
+}
+
+cmd_main() {
+    local cmd="${1:-tui}"
+    [[ $# -gt 0 ]] && shift
+
+    case "$cmd" in
+        help|-h|--help) usage; return 0 ;;
+        version|-V|--version) printf '%s %s\n' "$APP" "$VERSION"; return 0 ;;
+    esac
+
+    require_cmd jq base64 sha1sum flock
+    init_data
+    case "$cmd" in
+        tui|menu) tui_main ;;
+        add) cmd_add "$@" ;;
+        list|ls) list_servers ;;
+        use|switch) [[ -n "${1:-}" ]] || die "Укажите сервер: $APP use N|ID|ИМЯ"; resolve_xray; use_server "$1" ;;
+        rm|remove|del) cmd_rm "$@" ;;
+        rename)
+            [[ -n "${1:-}" && -n "${2:-}" ]] || die "Использование: $APP rename N|ID \"Новое имя\""
+            rename_server "$1" "$2" ;;
+        start|up) start_xray ;;
+        stop|down) stop_xray ;;
+        restart) restart_xray ;;
+        status|st) status_xray ;;
+        gen|generate)
+            local check=false
+            [[ "${1:-}" == "--check" ]] && check=true
+            if [[ "$check" == true ]]; then check_current_config; else resolve_xray; generate_config; fi
+            ;;
+        check) check_current_config ;;
+        log|logs)
+            local lines=80 follow=""
+            while (($# > 0)); do
+                case "$1" in
+                    -n) lines="${2:-80}"; shift 2 ;;
+                    -f|--follow) follow=follow; shift ;;
+                    *) shift ;;
+                esac
+            done
+            show_log "$lines" "$follow" ;;
+        api) cmd_api "$@" ;;
+        tun) cmd_tun "$@" ;;
+        settings|set) cmd_settings "$@" ;;
+        sub|subs|subscription) cmd_sub "$@" ;;
+        doctor|diag) doctor ;;
+        migrate-legacy|migrate) migrate_legacy "${1:-}" ;;
+        *) err "Неизвестная команда: $cmd"; usage; return 1 ;;
+    esac
+}
+
+main() {
+    cmd_main "$@"
+}
+
+main "$@"
